@@ -293,6 +293,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
         } else if m.focus == focusViewport && key.Matches(msg, m.keys.Filter) {
             m.filterOutput()
         }
+    case tea.MouseMsg:
+        switch msg.Type {
+        case tea.MouseLeft:
+            if m.focus == focusList {
+                // If clicking on the list, change focus to the viewport
+                m.focus = focusViewport
+            } else if m.focus == focusViewport {
+                // If clicking on the viewport, change focus to the input
+                m.focus = focusInput
+                m.input.Focus()
+            } else if m.focus == focusInput {
+                // If clicking on the input, change focus to the list
+                m.focus = focusList
+            }
+        }
     }
 
     if m.focus == focusList {
@@ -445,7 +460,11 @@ func main() {
         log.Fatalf("Error loading config: %v", err)
     }
 
-    p := tea.NewProgram(initialModel(commands, vpDimensions, listDimensions, tiDimensions, completions))
+    p := tea.NewProgram(
+        initialModel(commands, vpDimensions, listDimensions, tiDimensions, completions),
+        tea.WithAltScreen(),      // Use alternate screen buffer
+        tea.WithMouseCellMotion(), // Enable mouse support
+    )
     if err := p.Start(); err != nil {
         log.Fatalf("Error: %v", err)
     }
