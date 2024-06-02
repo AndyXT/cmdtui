@@ -4,7 +4,7 @@ import (
     "bytes"
     "fmt"
     "io"
-    "os"
+    "log"
     "os/exec"
     "strings"
 
@@ -18,12 +18,12 @@ import (
 )
 
 var (
-    docStyle         = lipgloss.NewStyle().Margin(1, 2)
-    normalBorder     = lipgloss.NewStyle().Border(lipgloss.NormalBorder()).Padding(1)
-    focusedBorder    = lipgloss.NewStyle().Border(lipgloss.NormalBorder(), true).Padding(1).BorderForeground(lipgloss.Color("205")) // Pink color
-    activeButton     = lipgloss.NewStyle().Padding(0, 1).Foreground(lipgloss.Color("230")).Background(lipgloss.Color("205")) // Pink background
-    inactiveButton   = lipgloss.NewStyle().Padding(0, 1).Foreground(lipgloss.Color("62"))
-    helpText         = "Press tab to switch focus. Press enter to execute the command. Press q to quit. Press / to filter the output. Press ctrl+l to refresh."
+    docStyle       = lipgloss.NewStyle().Margin(1, 2)
+    normalBorder   = lipgloss.NewStyle().Border(lipgloss.NormalBorder()).Padding(1)
+    focusedBorder  = lipgloss.NewStyle().Border(lipgloss.NormalBorder(), true).Padding(1).BorderForeground(lipgloss.Color("205"))
+    activeButton   = lipgloss.NewStyle().Padding(0, 1).Foreground(lipgloss.Color("230")).Background(lipgloss.Color("205"))
+    inactiveButton = lipgloss.NewStyle().Padding(0, 1).Foreground(lipgloss.Color("62"))
+    helpText       = "Press tab to switch focus. Press enter to execute the command. Press q to quit. Press / to filter the output. Press ctrl+l to refresh."
 )
 
 type focusState int
@@ -35,8 +35,9 @@ const (
 )
 
 type command struct {
-    name string
-    cmd  []string
+    name   string
+    cmd    []string
+    prompt bool
 }
 
 type dimensions struct {
@@ -67,48 +68,50 @@ func loadConfig() ([]command, dimensions, dimensions, dimensions, []string, erro
         return nil, dimensions{}, dimensions{}, dimensions{}, nil, err
     }
 
-    // Get the table returned by the Lua script
     luaTable := L.Get(-1).(*lua.LTable)
-    buttonsTable := luaTable.RawGetString("buttons").(*lua.LTable)
-    var commands []command
+    commands := extractCommands(luaTable.RawGetString("buttons").(*lua.LTable))
+    vpDimensions := extractDimensions(luaTable.RawGetString("viewport").(*lua.LTable))
+    listDimensions := extractDimensions(luaTable.RawGetString("list").(*lua.LTable))
+    tiDimensions := dimensions{width: int(luaTable.RawGetString("textinput").(*lua.LTable).RawGetString("width").(lua.LNumber)), height: 1}
+    completions := extractCompletions(luaTable.RawGetString("completions").(*lua.LTable))
 
-    // Iterate over the Lua table and collect button names and commands
-    buttonsTable.ForEach(func(key lua.LValue, value lua.LValue) {
+    return commands, vpDimensions, listDimensions, tiDimensions, completions, nil
+}
+
+func extractCommands(buttonsTable *lua.LTable) []command {
+    var commands []command
+    buttonsTable.ForEach(func(_, value lua.LValue) {
         buttonTable := value.(*lua.LTable)
         name := buttonTable.RawGetString("name").String()
-        cmdTable := buttonTable.RawGetString("cmd").(*lua.LTable)
+        cmd := extractCmd(buttonTable.RawGetString("cmd").(*lua.LTable))
+        prompt := buttonTable.RawGetString("prompt").(lua.LBool)
 
-        var cmd []string
-        cmdTable.ForEach(func(_, cmdValue lua.LValue) {
-            cmd = append(cmd, cmdValue.String())
-        })
-
-        commands = append(commands, command{name, cmd})
+        commands = append(commands, command{name, cmd, bool(prompt)})
     })
+    return commands
+}
 
-    // Get viewport dimensions
-    vpTable := luaTable.RawGetString("viewport").(*lua.LTable)
-    vpWidth := int(vpTable.RawGetString("width").(lua.LNumber))
-    vpHeight := int(vpTable.RawGetString("height").(lua.LNumber))
+func extractCmd(cmdTable *lua.LTable) []string {
+    var cmd []string
+    cmdTable.ForEach(func(_, cmdValue lua.LValue) {
+        cmd = append(cmd, cmdValue.String())
+    })
+    return cmd
+}
 
-    // Get list dimensions
-    listTable := luaTable.RawGetString("list").(*lua.LTable)
-    listWidth := int(listTable.RawGetString("width").(lua.LNumber))
-    listHeight := int(listTable.RawGetString("height").(lua.LNumber))
+func extractDimensions(dimTable *lua.LTable) dimensions {
+    return dimensions{
+        width:  int(dimTable.RawGetString("width").(lua.LNumber)),
+        height: int(dimTable.RawGetString("height").(lua.LNumber)),
+    }
+}
 
-    // Get text input dimensions
-    tiTable := luaTable.RawGetString("textinput").(*lua.LTable)
-    tiWidth := int(tiTable.RawGetString("width").(lua.LNumber))
-    tiHeight := 1  // Fixed height for text input
-
-    // Get completions
-    completionsTable := luaTable.RawGetString("completions").(*lua.LTable)
+func extractCompletions(completionsTable *lua.LTable) []string {
     var completions []string
-    completionsTable.ForEach(func(key lua.LValue, value lua.LValue) {
+    completionsTable.ForEach(func(_, value lua.LValue) {
         completions = append(completions, value.String())
     })
-
-    return commands, dimensions{width: vpWidth, height: vpHeight}, dimensions{width: listWidth, height: listHeight}, dimensions{width: tiWidth, height: tiHeight}, completions, nil
+    return completions
 }
 
 func initialModel(commands []command, vpDimensions, listDimensions, tiDimensions dimensions, completions []string) model {
@@ -117,15 +120,13 @@ func initialModel(commands []command, vpDimensions, listDimensions, tiDimensions
         items[i] = listItem{cmd.name}
     }
 
-    delegate := customDelegate{}
-    l := list.New(items, delegate, listDimensions.width, listDimensions.height)
+    l := list.New(items, customDelegate{}, listDimensions.width, listDimensions.height)
     l.Title = "Buttons"
     l.SetShowStatusBar(false)
     l.SetFilteringEnabled(false)
     l.SetShowHelp(false)
 
-    vpHeight := vpDimensions.height - tiDimensions.height - 4  // Adjust for text input height and border
-    vp := viewport.New(vpDimensions.width, vpHeight)
+    vp := viewport.New(vpDimensions.width, vpDimensions.height-tiDimensions.height-4)
     vp.SetContent("Output will be displayed here...")
     vp.MouseWheelEnabled = true
 
@@ -160,21 +161,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
     case tea.KeyMsg:
         switch msg.String() {
         case "ctrl+n":
-            if m.focus == focusList {
-                m.focus = focusViewport
-            } else if m.focus == focusViewport {
-                m.focus = focusInput
-            } else {
-                m.focus = focusList
-            }
+            m.focus = (m.focus + 1) % 3
         case "ctrl+p":
-            if m.focus == focusList {
-                m.focus = focusInput
-            } else if m.focus == focusViewport {
-                m.focus = focusList
-            } else {
-                m.focus = focusViewport
-            }
+            m.focus = (m.focus + 2) % 3
         case "q":
             return m, tea.Quit
         case "?":
@@ -186,47 +175,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
             }
         }
 
-        if m.focus == focusList {
-            switch msg.String() {
-            case "enter":
-                idx := m.list.Index()
-                if idx >= 0 && idx < len(m.commands) {
-                    cmd := m.commands[idx]
-                    output, err := runCommand(cmd.cmd)
-                    if err != nil {
-                        m.output += fmt.Sprintf("%s: %s\n", cmd.name, err)
-                    } else {
-                        m.output += fmt.Sprintf("%s: %s\n", cmd.name, output)
-                    }
-                    m.viewport.SetContent(m.output)
-                    m.viewport.GotoBottom()
-                }
-            }
-        } else if m.focus == focusViewport {
-            switch msg.String() {
-            case "/":
-                m.filterOutput()
+        if m.focus == focusList && msg.String() == "enter" {
+            idx := m.list.Index()
+            if idx >= 0 && idx < len(m.commands) {
+                cmd := m.commands[idx]
+                m.runCommand(cmd.cmd, cmd.prompt)
             }
         } else if m.focus == focusInput {
             switch msg.String() {
             case "enter":
                 inputValue := m.input.Value()
-                output, err := runCommand(strings.Fields(inputValue))
-                if err != nil {
-                    m.output += fmt.Sprintf("%s: %s\n", inputValue, err)
-                } else {
-                    m.output += fmt.Sprintf("%s: %s\n", inputValue, output)
+                idx := m.list.Index()
+                if idx >= 0 && idx < len(m.commands) {
+                    cmd := m.commands[idx]
+                    fullCmd := append(cmd.cmd, inputValue)
+                    m.runCommand(fullCmd, false)
                 }
                 m.input.SetValue("")
-                m.viewport.SetContent(m.output)
-                m.viewport.GotoBottom()
-                m.currentIndex = -1
+                m.focus = focusList
             case "tab":
                 if len(m.completions) > 0 {
                     m.currentIndex = (m.currentIndex + 1) % len(m.completions)
                     m.input.SetValue(m.completions[m.currentIndex])
                 }
             }
+        } else if m.focus == focusViewport && msg.String() == "/" {
+            m.filterOutput()
         }
     }
 
@@ -247,6 +221,33 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
     return m, tea.Batch(cmds...)
 }
 
+func (m *model) runCommand(cmd []string, prompt bool) {
+    if len(cmd) == 0 {
+        return
+    }
+
+    if prompt {
+        m.input.SetValue("")
+        m.input.Focus()
+        m.focus = focusInput
+        return
+    }
+
+    m.output += fmt.Sprintf("Running command: %s\n", strings.Join(cmd, " "))
+    c := exec.Command(cmd[0], cmd[1:]...)
+    var out bytes.Buffer
+    c.Stdout = &out
+    c.Stderr = &out
+
+    if err := c.Run(); err != nil {
+        m.output += fmt.Sprintf("Error: %v\n", err)
+    } else {
+        m.output += out.String()
+    }
+    m.viewport.SetContent(m.output)
+    m.viewport.GotoBottom()
+}
+
 func (m *model) filterOutput() {
     lines := strings.Split(m.output, "\n")
     idx, err := fuzzyfinder.Find(
@@ -256,22 +257,22 @@ func (m *model) filterOutput() {
         },
     )
     if err == nil {
-        filteredLine := lines[idx]
-        m.viewport.SetContent(filteredLine)
+        m.viewport.SetContent(lines[idx])
     }
 }
 
 func (m model) View() string {
     var listStyle, viewportStyle, inputStyle lipgloss.Style
-    if m.focus == focusList {
+    switch m.focus {
+    case focusList:
         listStyle = focusedBorder
         viewportStyle = normalBorder
         inputStyle = normalBorder
-    } else if m.focus == focusViewport {
+    case focusViewport:
         listStyle = normalBorder
         viewportStyle = focusedBorder
         inputStyle = normalBorder
-    } else {
+    case focusInput:
         listStyle = normalBorder
         viewportStyle = normalBorder
         inputStyle = focusedBorder
@@ -281,7 +282,7 @@ func (m model) View() string {
     viewportView := viewportStyle.Render(m.viewport.View())
     inputView := inputStyle.Render(m.input.View())
 
-    var helpView string
+    helpView := ""
     if m.showHelp {
         helpView = "\n\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render(helpText)
     }
@@ -346,13 +347,11 @@ func (d customDelegate) Render(w io.Writer, m list.Model, index int, item list.I
 func main() {
     commands, vpDimensions, listDimensions, tiDimensions, completions, err := loadConfig()
     if err != nil {
-        fmt.Printf("Error loading config: %v\n", err)
-        os.Exit(1)
+        log.Fatalf("Error loading config: %v", err)
     }
 
     p := tea.NewProgram(initialModel(commands, vpDimensions, listDimensions, tiDimensions, completions))
     if err := p.Start(); err != nil {
-        fmt.Printf("Error: %v\n", err)
-        os.Exit(1)
+        log.Fatalf("Error: %v", err)
     }
 }
