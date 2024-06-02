@@ -12,6 +12,8 @@ import (
     "github.com/charmbracelet/bubbles/list"
     "github.com/charmbracelet/bubbles/viewport"
     "github.com/charmbracelet/bubbles/textinput"
+    help "github.com/charmbracelet/bubbles/help"
+    key "github.com/charmbracelet/bubbles/key"
     "github.com/charmbracelet/lipgloss"
     lua "github.com/yuin/gopher-lua"
     fuzzyfinder "github.com/ktr0731/go-fuzzyfinder"
@@ -58,6 +60,61 @@ type model struct {
     tiDimensions   dimensions
     completions    []string
     currentIndex   int
+    help           help.Model
+    keys           keyMap
+    prompInput     bool
+}
+
+type keyMap struct {
+    NextFocus key.Binding
+    PrevFocus key.Binding
+    Quit      key.Binding
+    Help      key.Binding
+    Execute   key.Binding
+    Filter    key.Binding
+    Refresh   key.Binding
+}
+
+var keys = keyMap{
+    NextFocus: key.NewBinding(
+        key.WithKeys("ctrl+n"),
+        key.WithHelp("ctrl+n", "next focus"),
+    ),
+    PrevFocus: key.NewBinding(
+        key.WithKeys("ctrl+p"),
+        key.WithHelp("ctrl+p", "prev focus"),
+    ),
+    Quit: key.NewBinding(
+        key.WithKeys("q"),
+        key.WithHelp("q", "quit"),
+    ),
+    Help: key.NewBinding(
+        key.WithKeys("?"),
+        key.WithHelp("?", "toggle help"),
+    ),
+    Execute: key.NewBinding(
+        key.WithKeys("enter"),
+        key.WithHelp("enter", "execute command"),
+    ),
+    Filter: key.NewBinding(
+        key.WithKeys("/"),
+        key.WithHelp("/", "filter output"),
+    ),
+    Refresh: key.NewBinding(
+        key.WithKeys("ctrl+l"),
+        key.WithHelp("ctrl+l", "refresh"),
+    ),
+}
+
+func (k keyMap) ShortHelp() []key.Binding {
+    return []key.Binding{k.NextFocus, k.PrevFocus, k.Execute, k.Filter, k.Refresh, k.Help, k.Quit}
+}
+
+func (k keyMap) FullHelp() [][]key.Binding {
+    return [][]key.Binding{
+        {k.NextFocus, k.PrevFocus, k.Execute, k.Filter},
+        {k.Refresh, k.Help, k.Quit},
+    }
 }
 
 func loadConfig() ([]command, dimensions, dimensions, dimensions, []string, error) {
@@ -123,7 +180,7 @@ func initialModel(commands []command, vpDimensions, listDimensions, tiDimensions
     l := list.New(items, customDelegate{}, listDimensions.width, listDimensions.height)
     l.Title = "Buttons"
     l.SetShowStatusBar(false)
-    l.SetFilteringEnabled(false)
+    l.SetFilteringEnabled(true)
     l.SetShowHelp(false)
 
     vp := viewport.New(vpDimensions.width, vpDimensions.height-tiDimensions.height-4)
@@ -135,18 +192,24 @@ func initialModel(commands []command, vpDimensions, listDimensions, tiDimensions
     ti.Focus()
     ti.Width = tiDimensions.width
 
+    h := help.New()
+    k := keys
+
     return model{
         list:           l,
         viewport:       vp,
         input:          ti,
         focus:          focusList,
         commands:       commands,
-        showHelp:       false,
+        showHelp:       true,
         vpDimensions:   vpDimensions,
         listDimensions: listDimensions,
         tiDimensions:   tiDimensions,
         completions:    completions,
         currentIndex:   -1,
+        help:           h,
+        keys:           k,
+        prompInput:     false,
     }
 }
 
@@ -159,37 +222,65 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
     switch msg := msg.(type) {
     case tea.KeyMsg:
-        switch msg.String() {
-        case "ctrl+n":
+        switch {
+        case key.Matches(msg, m.keys.NextFocus):
             m.focus = (m.focus + 1) % 3
-        case "ctrl+p":
+        case key.Matches(msg, m.keys.PrevFocus):
             m.focus = (m.focus + 2) % 3
-        case "q":
+        case key.Matches(msg, m.keys.Quit):
             return m, tea.Quit
-        case "?":
+        case key.Matches(msg, m.keys.Help):
             m.showHelp = !m.showHelp
-        case "ctrl+l":
+        case key.Matches(msg, m.keys.Refresh):
             if m.focus == focusViewport {
                 m.viewport.SetContent(m.output)
                 m.viewport.GotoBottom()
             }
         }
 
-        if m.focus == focusList && msg.String() == "enter" {
+        if m.focus == focusList && key.Matches(msg, m.keys.Execute) {
             idx := m.list.Index()
             if idx >= 0 && idx < len(m.commands) {
                 cmd := m.commands[idx]
-                m.runCommand(cmd.cmd, cmd.prompt)
+                if cmd.prompt {
+                    // Command requires input, prompt the user
+                    m.input.SetValue("")
+                    m.input.Focus()
+                    m.focus = focusInput
+                    m.prompInput = true
+                    m.currentIndex = idx
+                    return m, nil
+                }
+                m.runCommand(cmd)
             }
         } else if m.focus == focusInput {
             switch msg.String() {
             case "enter":
                 inputValue := m.input.Value()
-                idx := m.list.Index()
-                if idx >= 0 && idx < len(m.commands) {
-                    cmd := m.commands[idx]
-                    fullCmd := append(cmd.cmd, inputValue)
-                    m.runCommand(fullCmd, false)
+                if inputValue != "" {
+                    if m.prompInput {
+                        // get cmd from list to append to it
+                        idx := m.currentIndex
+                        if idx >= 0 && idx < len(m.commands) {
+                            cmd := m.commands[idx]
+                            fullCmd := append(cmd.cmd, inputValue)
+                            fullCommand := command{
+                                name:   cmd.name,
+                                cmd:    fullCmd,
+                                prompt: false,
+                            }
+                            m.runCommand(fullCommand)
+                        }
+                        m.prompInput = false
+                    } else {
+                        // Create command structure for arbitrary command
+                        cmd := command{
+                            name:   inputValue,
+                            cmd:    strings.Fields(inputValue),
+                            prompt: false,
+                        }
+                        m.runCommand(cmd)
+                    }
                 }
                 m.input.SetValue("")
                 m.focus = focusList
@@ -199,7 +290,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                     m.input.SetValue(m.completions[m.currentIndex])
                 }
             }
-        } else if m.focus == focusViewport && msg.String() == "/" {
+        } else if m.focus == focusViewport && key.Matches(msg, m.keys.Filter) {
             m.filterOutput()
         }
     }
@@ -221,20 +312,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
     return m, tea.Batch(cmds...)
 }
 
-func (m *model) runCommand(cmd []string, prompt bool) {
-    if len(cmd) == 0 {
+func (m *model) runCommand(cmd command) {
+    if len(cmd.cmd) == 0 {
         return
     }
 
-    if prompt {
+    if cmd.prompt {
         m.input.SetValue("")
         m.input.Focus()
         m.focus = focusInput
         return
     }
 
-    m.output += fmt.Sprintf("Running command: %s\n", strings.Join(cmd, " "))
-    c := exec.Command(cmd[0], cmd[1:]...)
+    m.output += fmt.Sprintf("Running command: %s\n", strings.Join(cmd.cmd, " "))
+    c := exec.Command(cmd.cmd[0], cmd.cmd[1:]...)
     var out bytes.Buffer
     c.Stdout = &out
     c.Stderr = &out
@@ -246,6 +337,10 @@ func (m *model) runCommand(cmd []string, prompt bool) {
     }
     m.viewport.SetContent(m.output)
     m.viewport.GotoBottom()
+
+    // Reset input and focus after running a command
+    m.input.SetValue("")
+    m.focus = focusList
 }
 
 func (m *model) filterOutput() {
@@ -284,7 +379,7 @@ func (m model) View() string {
 
     helpView := ""
     if m.showHelp {
-        helpView = "\n\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render(helpText)
+        helpView = "\n\n" + m.help.View(m.keys)
     }
 
     return docStyle.Render(
@@ -300,22 +395,22 @@ func (m model) View() string {
     ) + helpView
 }
 
-func runCommand(cmd []string) (string, error) {
-    if len(cmd) == 0 {
-        return "", fmt.Errorf("empty command")
-    }
-
-    c := exec.Command(cmd[0], cmd[1:]...)
-    var out bytes.Buffer
-    c.Stdout = &out
-    c.Stderr = &out
-
-    if err := c.Run(); err != nil {
-        return "", err
-    }
-
-    return out.String(), nil
-}
+// func runCommand(cmd []string) (string, error) {
+//     if len(cmd) == 0 {
+//         return "", fmt.Errorf("empty command")
+//     }
+//
+//     c := exec.Command(cmd[0], cmd[1:]...)
+//     var out bytes.Buffer
+//     c.Stdout = &out
+//     c.Stderr = &out
+//
+//     if err := c.Run(); err != nil {
+//         return "", err
+//     }
+//
+//     return out.String(), nil
+// }
 
 type listItem struct {
     title string
