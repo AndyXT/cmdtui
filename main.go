@@ -26,7 +26,13 @@ var (
     activeButton   = lipgloss.NewStyle().Padding(0, 1).Foreground(lipgloss.Color("230")).Background(lipgloss.Color("205"))
     inactiveButton = lipgloss.NewStyle().Padding(0, 1).Foreground(lipgloss.Color("62"))
     helpText       = "Press tab to switch focus. Press enter to execute the command. Press q to quit. Press / to filter the output. Press ctrl+l to refresh."
+    tabBorder      = lipgloss.NewStyle().Border(lipgloss.NormalBorder())
+    activeTabBorder = lipgloss.NewStyle().Border(lipgloss.NormalBorder(), true).BorderForeground(lipgloss.Color("205"))
+    tab            = lipgloss.NewStyle().Padding(0, 1)
+    activeTab      = lipgloss.NewStyle().Padding(0, 1).Foreground(lipgloss.Color("205")).Bold(true)
+    tabGap         = tab.Copy().Padding(0, 2)
 )
+
 
 type focusState int
 
@@ -49,7 +55,7 @@ type dimensions struct {
 
 type model struct {
     list           list.Model
-    viewport       viewport.Model
+    viewports      []viewport.Model // Change to slice of viewports
     input          textinput.Model
     output         string
     focus          focusState
@@ -63,6 +69,13 @@ type model struct {
     help           help.Model
     keys           keyMap
     prompInput     bool
+    currentTab     int // Current tab index
+    tabs           []string // Tabs titles
+}
+
+// Add a function to initialize tabs
+func initTabs() []string {
+    return []string{"Main", "Tab 2", "Tab 3"} // Add more tabs as needed
 }
 
 type keyMap struct {
@@ -73,6 +86,8 @@ type keyMap struct {
     Execute   key.Binding
     Filter    key.Binding
     Refresh   key.Binding
+    NextTab   key.Binding // Key binding for switching to the next tab
+    PrevTab   key.Binding // Key binding for switching to the previous tab
 }
 
 var keys = keyMap{
@@ -104,16 +119,25 @@ var keys = keyMap{
         key.WithKeys("ctrl+l"),
         key.WithHelp("ctrl+l", "refresh"),
     ),
+    NextTab: key.NewBinding(
+        key.WithKeys("]"),
+        key.WithHelp("]", "next tab"),
+    ),
+    PrevTab: key.NewBinding(
+        key.WithKeys("["),
+        key.WithHelp("[", "previous tab"),
+    ),
 }
 
 func (k keyMap) ShortHelp() []key.Binding {
-    return []key.Binding{k.NextFocus, k.PrevFocus, k.Execute, k.Filter, k.Refresh, k.Help, k.Quit}
+    return []key.Binding{k.NextFocus, k.PrevFocus, k.Execute, k.Filter, k.Refresh, k.Help, k.Quit, k.NextTab, k.PrevTab}
 }
 
 func (k keyMap) FullHelp() [][]key.Binding {
     return [][]key.Binding{
         {k.NextFocus, k.PrevFocus, k.Execute, k.Filter},
         {k.Refresh, k.Help, k.Quit},
+        {k.NextTab, k.PrevTab},
     }
 }
 
@@ -183,9 +207,14 @@ func initialModel(commands []command, vpDimensions, listDimensions, tiDimensions
     l.SetFilteringEnabled(true)
     l.SetShowHelp(false)
 
-    vp := viewport.New(vpDimensions.width, vpDimensions.height-tiDimensions.height-4)
-    vp.SetContent("Output will be displayed here...")
-    vp.MouseWheelEnabled = true
+    mainViewport := viewport.New(vpDimensions.width, vpDimensions.height-tiDimensions.height-4)
+    mainViewport.SetContent("Output will be displayed here...")
+    mainViewport.MouseWheelEnabled = true
+
+    otherViewport := viewport.New(vpDimensions.width, vpDimensions.height-tiDimensions.height-4)
+    otherViewport.SetContent("")
+
+    vp := []viewport.Model{mainViewport, otherViewport, otherViewport} // Add more viewports as needed
 
     ti := textinput.New()
     ti.Placeholder = "Type a command..."
@@ -197,7 +226,7 @@ func initialModel(commands []command, vpDimensions, listDimensions, tiDimensions
 
     return model{
         list:           l,
-        viewport:       vp,
+        viewports:      vp,
         input:          ti,
         focus:          focusList,
         commands:       commands,
@@ -210,6 +239,8 @@ func initialModel(commands []command, vpDimensions, listDimensions, tiDimensions
         help:           h,
         keys:           k,
         prompInput:     false,
+        currentTab:     0,
+        tabs:           initTabs(),
     }
 }
 
@@ -233,9 +264,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
             m.showHelp = !m.showHelp
         case key.Matches(msg, m.keys.Refresh):
             if m.focus == focusViewport {
-                m.viewport.SetContent(m.output)
-                m.viewport.GotoBottom()
+                m.viewports[m.currentTab].SetContent(m.output)
+                m.viewports[m.currentTab].GotoBottom()
             }
+        case key.Matches(msg, m.keys.NextTab):
+            m.currentTab = (m.currentTab + 1) % len(m.viewports)
+        case key.Matches(msg, m.keys.PrevTab):
+            m.currentTab = (m.currentTab - 1 + len(m.viewports)) % len(m.viewports)
         }
 
         if m.focus == focusList && key.Matches(msg, m.keys.Execute) {
@@ -258,8 +293,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
             case "enter":
                 inputValue := m.input.Value()
                 if inputValue != "" {
-                    if m.prompInput {
-                        // get cmd from list to append to it
+                    if m.prompInput == true {
+                        // Get cmd from list to append to it
                         idx := m.currentIndex
                         if idx >= 0 && idx < len(m.commands) {
                             cmd := m.commands[idx]
@@ -320,7 +355,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
         cmds = append(cmds, inputCmd)
     } else {
         var viewportCmd tea.Cmd
-        m.viewport, viewportCmd = m.viewport.Update(msg)
+        m.viewports[m.currentTab], viewportCmd = m.viewports[m.currentTab].Update(msg)
         cmds = append(cmds, viewportCmd)
     }
 
@@ -350,12 +385,13 @@ func (m *model) runCommand(cmd command) {
     } else {
         m.output += out.String()
     }
-    m.viewport.SetContent(m.output)
-    m.viewport.GotoBottom()
+    m.viewports[m.currentTab].SetContent(m.output)
+    m.viewports[m.currentTab].GotoBottom()
 
     // Reset input and focus after running a command
     m.input.SetValue("")
     m.focus = focusList
+    m.prompInput = false // Reset the prompt input flag
 }
 
 func (m *model) filterOutput() {
@@ -367,7 +403,7 @@ func (m *model) filterOutput() {
         },
     )
     if err == nil {
-        m.viewport.SetContent(lines[idx])
+        m.viewports[m.currentTab].SetContent(lines[idx])
     }
 }
 
@@ -388,8 +424,22 @@ func (m model) View() string {
         inputStyle = focusedBorder
     }
 
+    // Render tabs
+    var tabViews []string
+    for i, t := range m.tabs {
+        var style lipgloss.Style
+        if i == m.currentTab {
+            style = activeTab
+        } else {
+            style = tab
+        }
+        tabViews = append(tabViews, style.Render(t))
+    }
+
+    tabs := lipgloss.JoinHorizontal(lipgloss.Top, tabGap.Render("|"), lipgloss.JoinHorizontal(lipgloss.Top, tabViews...))
+
     listView := listStyle.Render(m.list.View())
-    viewportView := viewportStyle.Render(m.viewport.View())
+    viewportView := viewportStyle.Render(m.viewports[m.currentTab].View())
     inputView := inputStyle.Render(m.input.View())
 
     helpView := ""
@@ -398,34 +448,21 @@ func (m model) View() string {
     }
 
     return docStyle.Render(
-        lipgloss.JoinHorizontal(
-            lipgloss.Top,
-            listView,
-            lipgloss.JoinVertical(
-                lipgloss.Left,
-                viewportView,
-                inputView,
+        lipgloss.JoinVertical(
+            lipgloss.Left,
+            tabs,
+            lipgloss.JoinHorizontal(
+                lipgloss.Top,
+                listView,
+                lipgloss.JoinVertical(
+                    lipgloss.Left,
+                    viewportView,
+                    inputView,
+                ),
             ),
         ),
     ) + helpView
 }
-
-// func runCommand(cmd []string) (string, error) {
-//     if len(cmd) == 0 {
-//         return "", fmt.Errorf("empty command")
-//     }
-//
-//     c := exec.Command(cmd[0], cmd[1:]...)
-//     var out bytes.Buffer
-//     c.Stdout = &out
-//     c.Stderr = &out
-//
-//     if err := c.Run(); err != nil {
-//         return "", err
-//     }
-//
-//     return out.String(), nil
-// }
 
 type listItem struct {
     title string
